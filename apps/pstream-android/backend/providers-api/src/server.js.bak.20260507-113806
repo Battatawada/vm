@@ -1,0 +1,378 @@
+import cors from "cors";
+import express from "express";
+
+import { config } from "./config.js";
+import { normalizeRunOutput } from "./normalize.js";
+import { providers } from "./providers.js";
+
+const app = express();
+
+app.use(cors());
+
+function parsePositiveInt(value) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function parseNonEmptyString(value) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const text = String(value).trim();
+  return text.length > 0 ? text : undefined;
+}
+
+function normalizeImdbId(value) {
+  const raw = parseNonEmptyString(value);
+  if (!raw) {
+    return undefined;
+  }
+  return raw.startsWith("tt") ? raw : `tt${raw.replace(/^tt/i, "")}`;
+}
+
+function buildMediaFromQuery(query) {
+  const type = query.type === "tv" ? "show" : query.type;
+  const tmdbId = parsePositiveInt(query.tmdbId);
+  const year = parsePositiveInt(query.year);
+  const season = parsePositiveInt(query.season);
+  const episode = parsePositiveInt(query.episode);
+  const title = typeof query.title === "string" ? query.title.trim() : "";
+  const imdbId = normalizeImdbId(query.imdbId);
+
+  if (type !== "movie" && type !== "show") {
+    return { error: "Query parameter 'type' must be 'movie' or 'show'." };
+  }
+
+  if (!tmdbId) {
+    return { error: "Query parameter 'tmdbId' must be a positive integer." };
+  }
+
+  if (!title) {
+    return { error: "Query parameter 'title' is required." };
+  }
+
+  if (type === "show" && ((season && !episode) || (!season && episode))) {
+    return { error: "TV scraping requires both 'season' and 'episode' when either is provided." };
+  }
+
+  if (type === "movie") {
+    return {
+      media: {
+        type: "movie",
+        tmdbId: String(tmdbId),
+        title,
+        ...(year ? { releaseYear: year } : {}),
+        ...(imdbId ? { imdbId } : {}),
+      },
+    };
+  }
+
+  if (season && episode) {
+    const seasonTmdbId =
+      parseNonEmptyString(query.seasonTmdbId) || `${tmdbId}-s${season}`;
+    const episodeTmdbId =
+      parseNonEmptyString(query.episodeTmdbId) ||
+      `${tmdbId}-s${season}-e${episode}`;
+    const seasonTitle =
+      parseNonEmptyString(query.seasonTitle) || `Season ${season}`;
+
+    return {
+      media: {
+        type: "show",
+        tmdbId: String(tmdbId),
+        title,
+        ...(year ? { releaseYear: year } : {}),
+        ...(imdbId ? { imdbId } : {}),
+        season: {
+          number: season,
+          tmdbId: seasonTmdbId,
+          title: seasonTitle,
+        },
+        episode: {
+          number: episode,
+          tmdbId: episodeTmdbId,
+        },
+      },
+    };
+  }
+
+  return {
+    media: {
+      type: "show",
+      tmdbId: String(tmdbId),
+      title,
+      ...(year ? { releaseYear: year } : {}),
+      ...(imdbId ? { imdbId } : {}),
+    },
+  };
+}
+
+function parseSourceOrder(queryValue) {
+  if (typeof queryValue !== "string" || !queryValue.trim()) {
+    return undefined;
+  }
+
+  const parts = queryValue
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return parts.length > 0 ? parts : undefined;
+}
+
+function sortEmbedsForSelection(embeds, targetEmbedId) {
+  return [...embeds].sort((a, b) => {
+    const aScore = a.embedId === targetEmbedId ? 0 : 1;
+    const bScore = b.embedId === targetEmbedId ? 0 : 1;
+    return aScore - bScore;
+  });
+}
+
+function sortEmbedsByCatalog(embeds) {
+  const embedCatalog = providers.listEmbeds().map((embed) => embed.id);
+  return [...embeds].sort((a, b) => {
+    const aIndex = embedCatalog.indexOf(a.embedId);
+    const bIndex = embedCatalog.indexOf(b.embedId);
+    const safeA = aIndex === -1 ? Number.MAX_SAFE_INTEGER : aIndex;
+    const safeB = bIndex === -1 ? Number.MAX_SAFE_INTEGER : bIndex;
+    return safeA - safeB;
+  });
+}
+
+function isSelectionMiss(error) {
+  if (!error) {
+    return false;
+  }
+  const name = typeof error?.name === "string" ? error.name : "";
+  const message = typeof error?.message === "string" ? error.message : String(error);
+  return (
+    name === "NotFoundError" ||
+    message.includes("No streams found") ||
+    message.includes("No playable streams found") ||
+    message.includes("Source is not compatible") ||
+    message.includes("Source with ID not found") ||
+    message.includes("Embed with ID not found")
+  );
+}
+
+async function runEmbedFromSource({ media, sourceId, embedId }) {
+  const sourceMeta = providers.getMetadata(sourceId);
+  const embedMeta = providers.getMetadata(embedId);
+
+  let sourceOutput;
+  try {
+    sourceOutput = await providers.runSourceScraper({
+      media,
+      id: sourceId,
+    });
+  } catch (error) {
+    if (isSelectionMiss(error)) {
+      return null;
+    }
+    throw error;
+  }
+
+  const matchingEmbeds = sortEmbedsForSelection(
+    (sourceOutput.embeds || []).filter((entry) => entry.embedId === embedId),
+    embedId,
+  );
+
+  for (const match of matchingEmbeds) {
+    try {
+      const embedOutput = await providers.runEmbedScraper({
+        url: match.url,
+        id: embedId,
+      });
+
+      if (embedOutput?.stream?.[0]) {
+        return normalizeRunOutput(
+          {
+            sourceId,
+            embedId,
+            stream: embedOutput.stream[0],
+          },
+          sourceMeta,
+          embedMeta,
+        );
+      }
+    } catch (_) {
+    }
+  }
+
+  return null;
+}
+
+async function runSelectedSourceOnly({ media, sourceId }) {
+  const sourceMeta = providers.getMetadata(sourceId);
+
+  let sourceOutput;
+  try {
+    sourceOutput = await providers.runSourceScraper({
+      media,
+      id: sourceId,
+    });
+  } catch (error) {
+    if (isSelectionMiss(error)) {
+      return null;
+    }
+    throw error;
+  }
+
+  if (sourceOutput?.stream?.[0]) {
+    return normalizeRunOutput(
+      {
+        sourceId,
+        stream: sourceOutput.stream[0],
+      },
+      sourceMeta,
+      null,
+    );
+  }
+
+  const sortedEmbeds = sortEmbedsByCatalog(sourceOutput?.embeds || []);
+  for (const embed of sortedEmbeds) {
+    try {
+      const embedOutput = await providers.runEmbedScraper({
+        url: embed.url,
+        id: embed.embedId,
+      });
+
+      if (embedOutput?.stream?.[0]) {
+        const embedMeta = providers.getMetadata(embed.embedId);
+        return normalizeRunOutput(
+          {
+            sourceId,
+            embedId: embed.embedId,
+            stream: embedOutput.stream[0],
+          },
+          sourceMeta,
+          embedMeta,
+        );
+      }
+    } catch (_) {
+    }
+  }
+
+  return null;
+}
+
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "providers-api",
+    timeoutMs: config.requestTimeoutMs,
+    simpleProxyConfigured: Boolean(config.simpleProxyUrl),
+    m3u8ProxyConfigured: Boolean(config.m3u8ProxyUrl),
+  });
+});
+
+app.get("/sources", (_req, res) => {
+  res.json({
+    sources: providers.listSources().map((source) => ({
+      id: source.id,
+      name: source.name,
+      rank: source.rank,
+      disabled: Boolean(source.disabled),
+      flags: source.flags ?? [],
+    })),
+    embeds: providers.listEmbeds().map((embed) => ({
+      id: embed.id,
+      name: embed.name,
+      rank: embed.rank,
+      disabled: Boolean(embed.disabled),
+      flags: embed.flags ?? [],
+    })),
+  });
+});
+
+app.get("/scrape/single", async (req, res) => {
+  try {
+    const selectedId = parseNonEmptyString(req.query.selectedId);
+    const selectedType = parseNonEmptyString(req.query.selectedType);
+    const parentSourceId = parseNonEmptyString(req.query.parentSourceId);
+
+    if (!selectedId || !selectedType) {
+      return res.status(400).json({
+        error: "selectedId and selectedType are required.",
+      });
+    }
+
+    const mediaResult = buildMediaFromQuery(req.query);
+    if (mediaResult.error) {
+      return res.status(400).json({ error: mediaResult.error });
+    }
+
+    let result = null;
+
+    if (selectedType === "embed") {
+      if (!parentSourceId) {
+        return res.status(400).json({
+          error: "parentSourceId is required when selectedType=embed.",
+        });
+      }
+
+      result = await runEmbedFromSource({
+        media: mediaResult.media,
+        sourceId: parentSourceId,
+        embedId: selectedId,
+      });
+    } else if (selectedType === "source") {
+      result = await runSelectedSourceOnly({
+        media: mediaResult.media,
+        sourceId: selectedId,
+      });
+    } else {
+      return res.status(400).json({
+        error: "selectedType must be 'source' or 'embed'.",
+      });
+    }
+
+    if (!result) {
+      return res.status(404).json({
+        error: "No playable stream found for selected source/embed.",
+      });
+    }
+
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.get("/scrape/run", async (req, res) => {
+  try {
+    const mediaResult = buildMediaFromQuery(req.query);
+    if (mediaResult.error) {
+      return res.status(400).json({ error: mediaResult.error });
+    }
+
+    const sourceOrder = parseSourceOrder(req.query.sourceOrder);
+    const output = await providers.runAll({
+      media: mediaResult.media,
+      sourceOrder,
+    });
+
+    if (!output) {
+      return res.status(404).json({ error: "No stream found." });
+    }
+
+    const sourceMeta = providers.getMetadata(output.sourceId);
+    const embedMeta = output.embedId ? providers.getMetadata(output.embedId) : null;
+
+    return res.json(normalizeRunOutput(output, sourceMeta, embedMeta));
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.listen(config.port, () => {
+  console.log(`providers-api listening on :${config.port}`);
+});
